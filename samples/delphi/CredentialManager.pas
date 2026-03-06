@@ -41,9 +41,7 @@ interface
 
 uses
   System.SysUtils, System.Classes, System.IniFiles, System.NetEncoding,
-  Winapi.Windows, Winapi.Bcrypt;
-
-const
+  Winapi.Windows, Winapi.Bcrypt;const
   ENC_PREFIX = 'ENC:';
 
 type
@@ -90,9 +88,6 @@ type
   end;
 
 implementation
-
-uses
-  System.Math;
 
 // ---------------------------------------------------------------------------
 // TCredentialReader
@@ -227,27 +222,49 @@ var
   KeyObjSize, DataSize, PlainSize: DWORD;
   AuthInfo: BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO;
   Status: NTSTATUS;
+  ModeStr: string;
+  ModeBytesLen: ULONG;
 begin
   Result := nil;
 
-  OleCheck(BCryptOpenAlgorithmProvider(hAlg, 'AES', nil, 0));
+  // BCrypt functions return NTSTATUS (not HRESULT). A non-negative value
+  // indicates success (STATUS_SUCCESS = 0). We check Status < 0 for errors.
+  Status := BCryptOpenAlgorithmProvider(hAlg, 'AES', nil, 0);
+  if Status < 0 then
+    raise ECredentialManagerError.CreateFmt(
+      'BCryptOpenAlgorithmProvider failed with status 0x%x', [Status]);
   try
-    OleCheck(BCryptSetProperty(hAlg, 'ChainingMode',
-      @BCRYPT_CHAIN_MODE_GCM[1], Length(BCRYPT_CHAIN_MODE_GCM) * 2, 0));
+    // BCRYPT_CHAIN_MODE_GCM is a wide-char string; BCrypt expects the byte
+    // length, which is character count × SizeOf(Char) (2 bytes in Delphi).
+    ModeStr := 'ChainingModeGCM';
+    ModeBytesLen := Length(ModeStr) * SizeOf(Char);
+    Status := BCryptSetProperty(hAlg, 'ChainingMode',
+      Pointer(ModeStr), ModeBytesLen, 0);
+    if Status < 0 then
+      raise ECredentialManagerError.CreateFmt(
+        'BCryptSetProperty (ChainingMode) failed with status 0x%x', [Status]);
 
-    BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, @KeyObjSize, SizeOf(DWORD), DataSize, 0);
+    Status := BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH,
+      @KeyObjSize, SizeOf(DWORD), DataSize, 0);
+    if Status < 0 then
+      raise ECredentialManagerError.CreateFmt(
+        'BCryptGetProperty failed with status 0x%x', [Status]);
+
     SetLength(KeyObj, KeyObjSize);
 
-    OleCheck(BCryptGenerateSymmetricKey(hAlg, hKey, @KeyObj[0], KeyObjSize,
-      @Key[0], Length(Key), 0));
+    Status := BCryptGenerateSymmetricKey(hAlg, hKey, @KeyObj[0], KeyObjSize,
+      @Key[0], Length(Key), 0);
+    if Status < 0 then
+      raise ECredentialManagerError.CreateFmt(
+        'BCryptGenerateSymmetricKey failed with status 0x%x', [Status]);
     try
       FillChar(AuthInfo, SizeOf(AuthInfo), 0);
-      AuthInfo.cbSize    := SizeOf(AuthInfo);
+      AuthInfo.cbSize        := SizeOf(AuthInfo);
       AuthInfo.dwInfoVersion := BCRYPT_AUTHENTICATED_CIPHER_MODE_INFO_VERSION;
-      AuthInfo.pbNonce   := @Nonce[0];
-      AuthInfo.cbNonce   := Length(Nonce);
-      AuthInfo.pbTag     := @Tag[0];
-      AuthInfo.cbTag     := Length(Tag);
+      AuthInfo.pbNonce       := @Nonce[0];
+      AuthInfo.cbNonce       := Length(Nonce);
+      AuthInfo.pbTag         := @Tag[0];
+      AuthInfo.cbTag         := Length(Tag);
 
       SetLength(Result, Length(CipherText));
       Status := BCryptDecrypt(hKey, @CipherText[0], Length(CipherText),
@@ -257,7 +274,7 @@ begin
         raise ECredentialManagerError.Create(
           'Authentication tag mismatch: data may have been tampered with.');
 
-      if Status <> 0 then
+      if Status < 0 then
         raise ECredentialManagerError.CreateFmt(
           'BCryptDecrypt failed with status 0x%x', [Status]);
 
