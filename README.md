@@ -1,2 +1,348 @@
-# Security
-Security in legacy applications
+# Security – Credential Vault for Legacy Applications
+
+A practical solution for securing plain-text credentials in legacy C# and Delphi applications.
+Replaces plain-text passwords in `.config` and `.ini` files with **AES-256-GCM encrypted** values,
+optionally backed by a central credential vault REST service.
+
+---
+
+## Problem Statement
+
+Legacy applications store database and user credentials in plain text inside `.config` and `.ini`
+files. This is a security risk. Requirements for the solution:
+
+- **State-of-the-art encryption** for all credential values at rest.
+- **Central storage** so that one vault serves multiple customers/applications.
+- **Service department access** for troubleshooting without per-customer credential management.
+- Compatible with existing **C# and Delphi** applications.
+
+---
+
+## Solution Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    Customer Network (secure zone)                    │
+│                                                                      │
+│  ┌──────────────────┐     X-Api-Key     ┌──────────────────────┐   │
+│  │  Legacy C# App   │──────────────────▶│  CredentialVault     │   │
+│  │  (uses Client    │                   │  .Server             │   │
+│  │   library)       │◀──────────────────│  (ASP.NET Core API)  │   │
+│  └──────────────────┘  decrypted value  │                      │   │
+│                                         │  Credentials stored  │   │
+│  ┌──────────────────┐                   │  AES-256-GCM         │   │
+│  │  Delphi App      │  HTTP/REST        │  encrypted in memory │   │
+│  │  (plain HTTP     │──────────────────▶│  (DB-backed in prod) │   │
+│  │   requests)      │                   └──────────────────────┘   │
+│  └──────────────────┘                            ▲                  │
+│                                                  │                  │
+│  ┌──────────────────┐                   X-Api-Key (master key)      │
+│  │  Service Dept.   │──────────────────────────────────────────────▶│
+│  │  (browser /      │                                               │
+│  │   curl)          │                                               │
+│  └──────────────────┘                                               │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### Key design decisions
+
+| Aspect | Decision |
+|---|---|
+| Encryption algorithm | **AES-256-GCM** (AEAD; provides confidentiality + integrity) |
+| Key derivation | **PBKDF2-SHA256** with 600 000 iterations (OWASP 2023 recommendation) |
+| Authentication | **API key** (X-Api-Key header); separate keys per application and for service dept. |
+| Central vs. local | Central vault recommended; local file encryption supported as fallback/migration step |
+| Delphi compatibility | Standard HTTP REST API – callable from any language |
+
+---
+
+## Repository Structure
+
+```
+Security/
+├── src/
+│   ├── CredentialVault.Core/           # Encryption primitives (AES-256-GCM, PBKDF2)
+│   │   ├── Encryption/
+│   │   │   ├── AesGcmEncryptor.cs      # Encrypt/Decrypt with AES-256-GCM
+│   │   │   └── SecretKeyDerivation.cs  # PBKDF2-SHA256 key derivation
+│   │   └── Models/
+│   │       ├── CredentialEntry.cs      # Vault entry model
+│   │       └── CredentialDtos.cs       # Request/response DTOs
+│   │
+│   ├── CredentialVault.Server/         # ASP.NET Core REST API (the central vault)
+│   │   ├── Controllers/
+│   │   │   └── CredentialsController.cs
+│   │   ├── Services/
+│   │   │   ├── VaultStore.cs           # In-memory AES-256-GCM encrypted store
+│   │   │   └── ApiKeyAuthentication.cs # API key auth handler + registry
+│   │   └── Program.cs
+│   │
+│   ├── CredentialVault.Client/         # C# client library for consuming the vault
+│   │   ├── Http/
+│   │   │   ├── IVaultClient.cs         # Interface for easy mocking/testing
+│   │   │   └── VaultHttpClient.cs      # HttpClient-based implementation
+│   │   └── VaultClientServiceCollectionExtensions.cs
+│   │
+│   └── CredentialVault.ConfigMigrator/ # CLI tool to encrypt legacy config/ini files
+│       └── Program.cs
+│
+└── tests/
+    └── CredentialVault.Tests/
+        ├── Core/                       # Unit tests for encryption primitives
+        ├── Server/                     # Unit tests for VaultStore
+        └── Integration/                # Integration tests for the REST API
+```
+
+---
+
+## Quick Start
+
+### 1. Generate a vault key
+
+```bash
+dotnet run --project src/CredentialVault.ConfigMigrator -- generate-key
+```
+
+Output:
+```
+AES-256 Key (Base64) - store this securely, e.g. as VAULT_KEY env var:
+FQhcBPYHcv2PO2RcWR7GD1uhpOfEngiFDY9W/8bCjHE=
+
+PBKDF2 salt for master-password derivation (Base64):
+h0qcWgQkfeSA7fl2rogwikZZl4Dtcyn9CZhfB5gxjJw=
+```
+
+Store this key as an **environment variable** on the vault server host — never in source control.
+
+### 2. Generate API keys
+
+```bash
+# One key per application + one master key for the service department
+dotnet run --project src/CredentialVault.ConfigMigrator -- generate-api-key
+```
+
+### 3. Start the vault server
+
+```bash
+export VAULT_KEY="<base64-key-from-step-1>"
+
+dotnet run --project src/CredentialVault.Server
+```
+
+Configure API keys in `appsettings.json` (or via environment / secrets manager):
+
+```json
+{
+  "ApiKeys": [
+    { "Name": "LegacyCrmApp",      "Key": "<app-api-key>",     "Role": "Application" },
+    { "Name": "ServiceDepartment", "Key": "<service-api-key>", "Role": "ServiceDepartment" }
+  ]
+}
+```
+
+### 4. Store credentials
+
+```bash
+# Store a credential via the REST API
+curl -X PUT https://vault:8443/api/credentials \
+  -H "X-Api-Key: <app-api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"application":"CRM","key":"DatabasePassword","plainTextValue":"MySecret@123","description":"CRM DB password"}'
+```
+
+### 5. Retrieve credentials in a C# application
+
+#### With the client library (recommended)
+
+```csharp
+// In your DI setup (e.g. Program.cs / Startup.cs)
+services.AddCredentialVaultClient(
+    vaultBaseUrl: "https://vault:8443",
+    apiKey: configuration["VaultApiKey"]  // read from env or config
+);
+
+// Inject IVaultClient into your service
+public class DatabaseFactory
+{
+    private readonly IVaultClient _vault;
+
+    public DatabaseFactory(IVaultClient vault) => _vault = vault;
+
+    public async Task<string> GetConnectionStringAsync()
+    {
+        return await _vault.GetCredentialAsync("CRM", "DatabasePassword")
+            ?? throw new InvalidOperationException("Credential not found in vault.");
+    }
+}
+```
+
+#### Without DI (direct use)
+
+```csharp
+using var httpClient = new HttpClient { BaseAddress = new Uri("https://vault:8443/") };
+httpClient.DefaultRequestHeaders.Add("X-Api-Key", "<app-api-key>");
+
+var vaultClient = new VaultHttpClient(httpClient);
+string password = await vaultClient.GetCredentialAsync("CRM", "DatabasePassword");
+```
+
+### 6. Retrieve credentials from Delphi
+
+Since the vault is a plain REST API, Delphi applications can use any HTTP library:
+
+```pascal
+// Using Indy (TIdHTTP) or TNetHTTPClient
+procedure TForm1.GetCredential;
+var
+  HTTP: TNetHTTPClient;
+  Response: IHTTPResponse;
+  JSON: TJSONObject;
+begin
+  HTTP := TNetHTTPClient.Create(nil);
+  try
+    HTTP.CustomHeaders['X-Api-Key'] := '<app-api-key>';
+    Response := HTTP.Get('https://vault:8443/api/credentials/CRM/DatabasePassword');
+    JSON := TJSONObject.ParseJSONValue(Response.ContentAsString) as TJSONObject;
+    try
+      ShowMessage(JSON.GetValue<string>('value'));
+    finally
+      JSON.Free;
+    end;
+  finally
+    HTTP.Free;
+  end;
+end;
+```
+
+---
+
+## Migrating Existing Config Files
+
+Use the `ConfigMigrator` CLI to encrypt credentials in existing files **without** deploying the
+vault server first. This is a migration step — afterwards, values can be loaded from the file
+or moved to the vault.
+
+### Encrypt an `.ini` file
+
+```bash
+dotnet run --project src/CredentialVault.ConfigMigrator -- encrypt settings.ini <base64-key>
+```
+
+Before:
+```ini
+[Database]
+password=MySecret$Pass123!
+apikey=prod-api-key-12345
+```
+
+After:
+```ini
+[Database]
+password=ENC:cN9VdhI5IAJBrogVJv39C5kDHwYv/2RunBtyFZGzduxra2yp2wKYNCxjvqhn
+apikey=ENC:DfjffPEhOTgnSrPJ+Wcj/qaSr4R94LMvEWvGiP8H7fpGFks4TOa9OV52d7n1iw==
+```
+
+A `.backup` copy of the original file is created automatically.
+
+### Encrypt an `.config` file
+
+```bash
+dotnet run --project src/CredentialVault.ConfigMigrator -- encrypt App.config <base64-key>
+```
+
+Encrypts `password=`, `pwd=`, `secret=`, and `connectionString=` attribute values.
+
+### Encrypt / decrypt a single value
+
+```bash
+dotnet run --project src/CredentialVault.ConfigMigrator -- encrypt-value "MyPassword" <key>
+# → ENC:...
+
+dotnet run --project src/CredentialVault.ConfigMigrator -- decrypt-value "ENC:..." <key>
+# → MyPassword
+```
+
+---
+
+## REST API Reference
+
+All endpoints require the `X-Api-Key` header.
+
+| Method | Path | Description |
+|---|---|---|
+| `PUT` | `/api/credentials` | Store (create or update) a credential |
+| `GET` | `/api/credentials/{app}/{key}` | Retrieve a decrypted credential |
+| `DELETE` | `/api/credentials/{app}/{key}` | Delete a credential |
+| `GET` | `/api/credentials/{app}` | List credential keys for an app (no values) |
+| `GET` | `/api/credentials` | List all credential keys (no values) |
+
+---
+
+## Security Considerations
+
+### Key management
+
+- The **vault key** (or master password) must be injected via the `VAULT_KEY` environment variable
+  or a secrets manager (e.g. HashiCorp Vault, Azure Key Vault, AWS Secrets Manager).
+- **Never** commit the vault key or API keys to source control.
+- Rotate API keys periodically. Application keys should have `Role: Application`;
+  the service department key should have `Role: ServiceDepartment`.
+
+### Network security
+
+- Deploy the vault server behind **HTTPS** (TLS 1.2+). Use a reverse proxy (nginx, Caddy) or
+  configure Kestrel with a certificate.
+- Restrict vault network access to the secure network segment where legacy applications run.
+- The vault should **not** be reachable from the public internet.
+
+### AES-256-GCM properties
+
+- **256-bit key** — quantum-resistant in the near term.
+- **GCM (Galois/Counter Mode)** — provides authenticated encryption; tampered ciphertexts are
+  detected and rejected (throws `AuthenticationTagMismatchException`).
+- **Random nonce per encryption** — the same plaintext produces different ciphertext each time,
+  preventing pattern analysis.
+- The stored format is: `[nonce (12 bytes)] [GCM tag (16 bytes)] [ciphertext (n bytes)]`,
+  Base64-encoded with an `ENC:` prefix when stored in config/ini files.
+
+### Service department access
+
+The service department is issued a **master API key** with `Role: ServiceDepartment`. This key:
+- Has access to all credentials across all applications via the listing endpoints.
+- Can store and retrieve any credential for troubleshooting.
+- Is kept in a secure password manager; not embedded in any application.
+
+This approach means one master key works across **all customers** — no per-customer maintenance.
+If a key is compromised, rotate only that key.
+
+### Production hardening
+
+The `VaultStore` is currently in-memory (credentials are lost on restart). For production:
+
+1. Replace `VaultStore` with a **database-backed** implementation (SQL Server, PostgreSQL, SQLite).
+2. The encrypted values can be stored safely in the database; the vault key stays only on the
+   application server (environment variable or secrets manager).
+3. Consider **mTLS** between applications and the vault for mutual authentication.
+
+---
+
+## Running Tests
+
+```bash
+dotnet test
+```
+
+42 tests covering:
+- AES-256-GCM encrypt/decrypt round-trips
+- Key derivation with PBKDF2-SHA256
+- VaultStore CRUD operations
+- REST API integration (authentication, CRUD, listing)
+
+---
+
+## Building
+
+```bash
+dotnet build
+```
+
