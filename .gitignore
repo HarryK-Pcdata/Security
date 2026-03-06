@@ -1,0 +1,30 @@
+# Build outputs
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# NuGet packages
+packages/
+*.nupkg
+
+# Publish outputs
+publish/
+
+# Data directory (contains encrypted secrets at runtime – not committed)
+src/CredentialManager.Server/data/
+
+# Key files (NEVER commit key material)
+*.key
+*.pem
+*.pfx
+*.p12
+
+# dotnet test results
+TestResults/
+coverage/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
