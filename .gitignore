@@ -1,0 +1,25 @@
+## .NET build output
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+## NuGet packages
+*.nupkg
+*.snupkg
+packages/
+!**/packages/repositories.config
+.nuget/
+
+## Backup files created by ConfigMigrator
+*.backup
+
+## IDE files
+.idea/
+*.sln.DotSettings.user
+.vscode/settings.json
+
+## OS generated files
+.DS_Store
+Thumbs.db
