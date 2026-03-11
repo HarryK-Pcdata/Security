@@ -56,6 +56,171 @@ files. This is a security risk. Requirements for the solution:
 
 ---
 
+## Hosting & Deployment
+
+### On-Premises (Recommended)
+
+The vault runs **inside the customer's secure network segment** — the same LAN as the legacy
+applications. The service department connects over a VPN when remote access is needed.
+
+```mermaid
+flowchart TB
+    subgraph WAN["🌐  WAN / Internet"]
+        SD["💻  Service Department\n(technician's PC)"]
+    end
+
+    SD -- "VPN tunnel" --> FW
+
+    subgraph CUSTOMER["🏢  Customer Site — Secure Network Segment"]
+
+        FW["🛡️  Firewall\nblocks inbound 443 except via VPN\nallows internal LAN → vault :443"]
+
+        subgraph VAULT_HOST["🖥️  Vault Host  (dedicated VM, bare-metal, or container)"]
+            direction TB
+            PROXY["⚙️  Reverse Proxy\nnginx / Caddy\nTLS 1.3  ·  port 443 (LAN)"]
+            API["🔐  CredentialVault.Server\nASP.NET Core  ·  port 5000\n(loopback / 127.0.0.1 only)"]
+            VAULT_KEY["🔑  VAULT_KEY\nenv var or OS secret store\n(never written to disk)"]
+            PROXY --> API
+            VAULT_KEY -. "injected at\nprocess start" .-> API
+        end
+
+        subgraph DB_HOST["🗄️  Database Host  (same or separate VM)"]
+            DB[("SQL Server\nor PostgreSQL\nAES-256-GCM encrypted rows")]
+        end
+
+        subgraph APP_SERVERS["📦  Application Servers"]
+            CS["C# Legacy App\n+ CredentialVault.Client\nlibrary"]
+            DEL["Delphi Legacy App\n(TNetHTTPClient / Indy\nHTTP calls)"]
+        end
+
+        FW    -- "HTTPS · master API key"            --> PROXY
+        CS    -- "HTTPS · app-specific API key"      --> PROXY
+        DEL   -- "HTTPS · app-specific API key"      --> PROXY
+        API   -- "encrypted rows\n(VAULT_KEY stays on vault host)" --> DB
+    end
+```
+
+> **Why inside the LAN?** The vault never needs to be public-facing. Keeping it on the internal
+> network segment eliminates an entire class of internet-based attacks without requiring additional
+> network hardening.
+
+---
+
+### Component Reference
+
+| Component | Runs on | Listens on | Notes |
+|---|---|---|---|
+| **Reverse Proxy** (nginx / Caddy) | Vault Host | LAN :443 (TLS) | Handles TLS termination; forwards to localhost:5000 |
+| **CredentialVault.Server** | Vault Host | 127.0.0.1 :5000 | Not exposed directly; only reachable via proxy |
+| **Database** | DB Host (or same VM) | Internal only | Stores AES-256-GCM encrypted credential rows |
+| **Legacy C# App** | App Server(s) | — | Uses CredentialVault.Client library |
+| **Legacy Delphi App** | App Server(s) | — | Uses plain HTTP REST calls |
+| **Service Dept.** | Technician PC | — | Connects via VPN; uses master API key |
+
+---
+
+### Firewall Rules
+
+| Direction | Source | Destination | Port | Protocol | Purpose |
+|---|---|---|---|---|---|
+| Inbound | VPN range | Vault Host | 443 | TCP/HTTPS | Service dept. access |
+| Inbound | App Servers (LAN) | Vault Host | 443 | TCP/HTTPS | App credential retrieval |
+| Inbound | All | Vault Host | 5000 | TCP | **BLOCK** – internal only |
+| Outbound | Vault Host | DB Host | 1433 / 5432 | TCP | DB connection |
+| Inbound | All | DB Host | 1433 / 5432 | TCP | **BLOCK** – vault host only |
+
+---
+
+### Docker Compose Deployment
+
+The simplest way to run the vault and its database together on a single host:
+
+```yaml
+# docker-compose.yml  –  place on the vault host
+services:
+
+  vault:
+    image: mcr.microsoft.com/dotnet/aspnet:10.0
+    build:
+      context: .
+      dockerfile: src/CredentialVault.Server/Dockerfile
+    environment:
+      # Vault key: generate with `ConfigMigrator generate-key`, store in a secrets manager
+      - VAULT_KEY=${VAULT_KEY}
+      - ASPNETCORE_URLS=http://+:5000
+      - ConnectionStrings__VaultDb=Host=db;Database=vault;Username=vault;Password=${DB_PASSWORD}
+    ports: []                        # NOT exposed to host; only reachable via proxy container
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+  proxy:
+    image: caddy:2
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+    ports:
+      - "443:443"                    # only port exposed to the LAN
+    depends_on: [vault]
+    restart: unless-stopped
+
+  db:
+    image: postgres:16
+    environment:
+      - POSTGRES_DB=vault
+      - POSTGRES_USER=vault
+      - POSTGRES_PASSWORD=${DB_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vault"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  caddy_data:
+  db_data:
+```
+
+```
+# Caddyfile
+vault.internal {
+    reverse_proxy vault:5000
+    tls internal          # Caddy auto-generates a LAN certificate
+}
+```
+
+```bash
+# Start
+export VAULT_KEY="<base64-key>"
+export DB_PASSWORD="<strong-random-password>"
+docker compose up -d
+```
+
+> **Tip:** Store `VAULT_KEY` and `DB_PASSWORD` in a `.env` file that is **not** committed to
+> source control, or inject them via your secrets manager (e.g. HashiCorp Vault, Azure Key Vault).
+
+---
+
+### Alternative: Cloud-Hosted
+
+If the customer prefers a cloud deployment (Azure, AWS, GCP), the topology is identical — replace
+the on-premises LAN with a **private VNet / VPC** and restrict access using security groups or
+NSG rules. The vault should still **never** be reachable from the public internet.
+
+| On-Premises component | Azure equivalent | AWS equivalent |
+|---|---|---|
+| VM / bare-metal | Azure VM or Container App | EC2 or ECS Fargate |
+| Reverse proxy | Azure Application Gateway (internal) | Internal ALB |
+| SQL Server / PostgreSQL | Azure SQL / Flexible Server | RDS |
+| VAULT_KEY env var | Azure Key Vault reference | AWS Secrets Manager |
+| VPN for service dept. | Azure VPN Gateway / Bastion | AWS Client VPN |
+
+---
+
 ## Repository Structure
 
 ```
@@ -144,7 +309,7 @@ Configure API keys in `appsettings.json` (or via environment / secrets manager):
 
 ```bash
 # Store a credential via the REST API
-curl -X PUT https://vault:8443/api/credentials \
+curl -X PUT https://vault.internal/api/credentials \
   -H "X-Api-Key: <app-api-key>" \
   -H "Content-Type: application/json" \
   -d '{"application":"CRM","key":"DatabasePassword","plainTextValue":"MySecret@123","description":"CRM DB password"}'
@@ -157,7 +322,7 @@ curl -X PUT https://vault:8443/api/credentials \
 ```csharp
 // In your DI setup (e.g. Program.cs / Startup.cs)
 services.AddCredentialVaultClient(
-    vaultBaseUrl: "https://vault:8443",
+    vaultBaseUrl: "https://vault.internal",
     apiKey: configuration["VaultApiKey"]  // read from env or config
 );
 
@@ -179,7 +344,7 @@ public class DatabaseFactory
 #### Without DI (direct use)
 
 ```csharp
-using var httpClient = new HttpClient { BaseAddress = new Uri("https://vault:8443/") };
+using var httpClient = new HttpClient { BaseAddress = new Uri("https://vault.internal/") };
 httpClient.DefaultRequestHeaders.Add("X-Api-Key", "<app-api-key>");
 
 var vaultClient = new VaultHttpClient(httpClient);
@@ -201,7 +366,7 @@ begin
   HTTP := TNetHTTPClient.Create(nil);
   try
     HTTP.CustomHeaders['X-Api-Key'] := '<app-api-key>';
-    Response := HTTP.Get('https://vault:8443/api/credentials/CRM/DatabasePassword');
+    Response := HTTP.Get('https://vault.internal/api/credentials/CRM/DatabasePassword');
     JSON := TJSONObject.ParseJSONValue(Response.ContentAsString) as TJSONObject;
     try
       ShowMessage(JSON.GetValue<string>('value'));
