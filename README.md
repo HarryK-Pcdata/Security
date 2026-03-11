@@ -491,6 +491,215 @@ The `VaultStore` is currently in-memory (credentials are lost on restart). For p
 
 ---
 
+## Alternatives
+
+The table below assesses each alternative against the four original requirements, then each option
+is described in detail.
+
+| Solution | Encryption at rest | Central storage | Service dept. access | C# + Delphi compatible | Self-hosted |
+|---|:---:|:---:|:---:|:---:|:---:|
+| **This project** (CredentialVault) | ✅ AES-256-GCM | ✅ | ✅ API key roles | ✅ | ✅ |
+| **HashiCorp Vault** | ✅ AES-256-GCM / Transit | ✅ | ✅ Policies + tokens | ✅ REST API | ✅ |
+| **CyberArk Conjur** (Community) | ✅ | ✅ | ✅ RBAC | ✅ REST API | ✅ |
+| **Infisical** (self-hosted) | ✅ | ✅ | ✅ RBAC | ✅ REST API | ✅ |
+| **Azure Key Vault** | ✅ FIPS 140-2 | ✅ | ✅ RBAC + access policies | ✅ REST / SDK | ☁️ cloud |
+| **AWS Secrets Manager** | ✅ KMS-backed | ✅ | ✅ IAM policies | ✅ REST / SDK | ☁️ cloud |
+| **Windows DPAPI** | ✅ (per-machine / per-user) | ❌ no central store | ❌ must access each machine | ✅ .NET API | ✅ |
+
+---
+
+### 1. HashiCorp Vault (Self-Hosted)
+
+[HashiCorp Vault](https://www.vaultproject.io/) is the industry-standard open-source secrets manager.
+It can be deployed on-premises and exposes a comprehensive REST API callable from any language.
+
+**How it meets the requirements**
+
+- **Encryption at rest** – Vault encrypts its storage backend with AES-256-GCM and can optionally
+  integrate with an HSM for key protection.
+- **Central storage** – a single Vault cluster serves all applications and customers via namespaces
+  or mount paths.
+- **Service department access** – fine-grained policies let the service team access any path without
+  managing per-customer credentials; audit logging records every read.
+- **C# + Delphi** – the [VaultSharp](https://github.com/rajanadar/VaultSharp) NuGet package wraps
+  the API for C#; Delphi can call the same REST API with any HTTP library.
+
+**Trade-offs vs. CredentialVault**
+
+| Aspect | CredentialVault | HashiCorp Vault |
+|---|---|---|
+| Complexity | Low — single binary | High — HA cluster, unsealing ceremony |
+| Features | Tailored to this use case | Dynamic secrets, PKI, SSH, audit log, … |
+| License | MIT | BSL 1.1 (free for non-competing use) |
+| Operational overhead | Minimal | Significant (init, unseal, renewal, upgrades) |
+
+**Example – store and retrieve a secret**
+
+```bash
+# Store
+vault kv put secret/crm/db password="MySecret@123"
+
+# Retrieve (returns JSON)
+vault kv get -field=password secret/crm/db
+```
+
+From Delphi or any HTTP client:
+
+```
+GET https://vault.internal:8200/v1/secret/data/crm/db
+X-Vault-Token: <service-token>
+```
+
+---
+
+### 2. CyberArk Conjur Community Edition (Self-Hosted)
+
+[CyberArk Conjur](https://www.conjur.org/) is an open-source secrets manager designed for DevOps
+and machine-identity scenarios. The Community Edition is free to self-host.
+
+**How it meets the requirements**
+
+- **Encryption at rest** – secrets are stored AES-256 encrypted in a PostgreSQL database.
+- **Central storage** – one Conjur instance manages secrets for all applications.
+- **Service department access** – RBAC roles let the service team retrieve any secret; full audit
+  trail is included.
+- **C# + Delphi** – official .NET SDK available; Delphi uses the REST API.
+
+**Trade-offs vs. CredentialVault**
+
+| Aspect | CredentialVault | Conjur Community |
+|---|---|---|
+| Setup | `dotnet run` | Docker Compose + initialisation scripts |
+| Auth methods | API key | JWT, LDAP, Kubernetes, API key |
+| Audit logging | Not built-in | Built-in |
+| Support | Community / in-house | CyberArk community |
+
+---
+
+### 3. Infisical (Self-Hosted Open Source)
+
+[Infisical](https://infisical.com/) is a modern, open-source secrets manager with a polished web
+UI, CLI, and REST API. The self-hosted edition is free (MIT licence).
+
+**How it meets the requirements**
+
+- **Encryption at rest** – end-to-end AES-256-GCM encryption; the server never sees plaintext
+  secrets (zero-knowledge model).
+- **Central storage** – projects and environments organise secrets centrally.
+- **Service department access** – machine identities with scoped token permissions; full audit log.
+- **C# + Delphi** – official .NET SDK and universal REST API.
+
+**Trade-offs vs. CredentialVault**
+
+| Aspect | CredentialVault | Infisical |
+|---|---|---|
+| UI | REST API only | Full web dashboard |
+| Secret versioning | Not built-in | Built-in |
+| Setup | Single binary | Docker Compose (multiple services) |
+| Open-source licence | MIT | MIT |
+
+---
+
+### 4. Azure Key Vault / AWS Secrets Manager (Cloud-Managed)
+
+If the customer accepts a cloud dependency, the managed services from Azure and AWS eliminate all
+operational overhead: no servers to run, patch, or back up.
+
+**Azure Key Vault**
+
+- Secrets stored with **FIPS 140-2 Level 2** HSMs.
+- Service department access via Azure RBAC (`Key Vault Secrets User` role on the vault resource).
+- C# via `Azure.Security.KeyVault.Secrets` NuGet; Delphi via REST with an Azure AD bearer token.
+
+```csharp
+var client = new SecretClient(new Uri("https://myvault.vault.azure.net/"),
+                              new DefaultAzureCredential());
+KeyVaultSecret secret = await client.GetSecretAsync("CRM--DatabasePassword");
+string value = secret.Value;
+```
+
+**AWS Secrets Manager**
+
+- Secrets encrypted with AWS KMS (AES-256).
+- Service department access via IAM policies (`secretsmanager:GetSecretValue`).
+- C# via `AWSSDK.SecretsManager` NuGet; Delphi via AWS Signature V4 REST API.
+
+**Trade-offs vs. CredentialVault**
+
+| Aspect | CredentialVault | Cloud KV |
+|---|---|---|
+| Data residency | On-premises | Cloud provider region |
+| Cost | Hosting cost only | Per-secret / per-API-call pricing |
+| Availability | Depends on your infra | SLA-backed (99.9 %+) |
+| Delphi auth | Simple API key header | OAuth2 / SigV4 token exchange required |
+| Works without internet | ✅ | ❌ |
+
+---
+
+### 5. Windows DPAPI + Encrypted Config Files (No Central Server)
+
+The Windows Data Protection API (DPAPI) can encrypt values using the machine or user key managed
+by Windows. This is the simplest option — no server needed — but it does **not** provide central
+storage.
+
+```csharp
+// Encrypt
+byte[] plain = Encoding.UTF8.GetBytes("MySecret@123");
+byte[] cipher = ProtectedData.Protect(plain, null, DataProtectionScope.LocalMachine);
+string encoded = Convert.ToBase64String(cipher);
+
+// Decrypt
+byte[] decoded = Convert.FromBase64String(encoded);
+string value = Encoding.UTF8.GetString(
+    ProtectedData.Unprotect(decoded, null, DataProtectionScope.LocalMachine));
+```
+
+**Why it doesn't fully meet the requirements**
+
+| Requirement | DPAPI |
+|---|---|
+| Encryption at rest | ✅ (machine-bound) |
+| Central storage | ❌ Each machine has its own key; credentials can't be shared |
+| Service dept. access | ❌ Service team must log into each machine to decrypt |
+| C# + Delphi | ⚠️ C# easy; Delphi requires CryptUnprotectData P/Invoke |
+
+DPAPI is suitable as a **local fallback** (which CredentialVault's ConfigMigrator already provides
+using a portable AES-256-GCM key) but cannot replace the central vault for multi-machine scenarios.
+
+---
+
+### Choosing a Solution
+
+```
+Start here
+    │
+    ▼
+On-premises required?
+    ├─ NO  ──▶  Azure Key Vault or AWS Secrets Manager
+    │
+    └─ YES
+           │
+           ▼
+       Delphi apps need to authenticate with OAuth2 / complex token flows?
+           ├─ NO  (simple API key is fine)
+           │       │
+           │       ▼
+           │   Operational complexity acceptable?
+           │       ├─ Minimal  ──▶  CredentialVault (this project)
+           │       ├─ Medium   ──▶  Infisical (self-hosted, web UI)
+           │       └─ High     ──▶  HashiCorp Vault or CyberArk Conjur
+           │
+           └─ YES (full enterprise PAM / dynamic secrets needed)
+                   └──▶  HashiCorp Vault Enterprise or CyberArk PAS
+```
+
+> **Recommendation for this use-case:** CredentialVault is a good fit when you want a
+> self-contained, easy-to-deploy solution with no additional infrastructure. If the customer
+> already has HashiCorp Vault or Azure Key Vault deployed, use that instead — the
+> `IVaultClient` interface in this project can be re-implemented against any backend.
+
+---
+
 ## Running Tests
 
 ```bash
