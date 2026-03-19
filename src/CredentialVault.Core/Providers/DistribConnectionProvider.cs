@@ -5,19 +5,22 @@ using CredentialVault.Core.Models;
 namespace CredentialVault.Core.Providers;
 
 /// <summary>
-/// Reads and writes Oracle database connection parameters stored in the
-/// <c>distribconnection</c> Windows environment variable.
+/// Reads and writes the full set of Delphi <c>GlobalReadIni</c> values stored
+/// in the <c>distribconnection</c> Windows environment variable.
 ///
 /// <para>
-/// The environment variable contains a semicolon-separated list of
-/// <c>key=value</c> pairs that map directly to the parameters used by the
-/// Delphi <c>SetDBParams</c> procedure:
+/// The variable contains a semicolon-separated list of <c>key=value</c> pairs
+/// covering all three INI sections (Language, Database, Local):
 /// </para>
 /// <code>
-/// Password=secret;Database=MYDB;UserName=scott;DriverId=Ora;CharacterSet=UTF8;VendorLib=C:\oracle\oci.dll;TnsAdmin=C:\oracle\network\admin
+/// ServerName=XE;UserName=DISTRIB;Password=ENC:…;OracleDllPath=oci.dll;
+/// TnsAdmin=;History=DISTRIB_HIS;DriverId=Ora;CharacterSet=UTF8;
+/// Server0=;Server1=;…;Server9=;
+/// Language=NL;LanguageEx=NLD;
+/// Company=1;Station=1;UserId=0
 /// </code>
 /// <para>
-/// When an <see cref="AesGcmEncryptor"/> is supplied the <c>Password</c>
+/// When an <see cref="AesGcmEncryptor"/> is supplied, the <c>Password</c>
 /// field is stored as an <c>ENC:…</c> token and decrypted on read.
 /// All other fields are stored in plain text.
 /// </para>
@@ -43,47 +46,45 @@ public sealed class DistribConnectionProvider
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Reads connection parameters from the <c>distribconnection</c>
-    /// environment variable.  The variable is searched in order:
-    /// <list type="number">
-    ///   <item>Machine-level (<c>HKLM</c>) – requires elevated rights to write.</item>
-    ///   <item>User-level (<c>HKCU</c>).</item>
-    ///   <item>Process-level (in-memory, useful for tests).</item>
-    /// </list>
+    /// Reads all connection parameters from the <c>distribconnection</c>
+    /// environment variable, searching Machine → User → Process scope in order.
+    /// Returns <c>null</c> when the variable is not set in any scope.
     /// </summary>
-    /// <returns>Parsed <see cref="ConnectionParameters"/>, or <c>null</c> when
-    /// the environment variable is not set.</returns>
     public ConnectionParameters? Read()
     {
         var raw = GetRawValue();
         if (raw is null)
             return null;
 
-        var dict = ParseKeyValues(raw);
-        var parameters = new ConnectionParameters();
+        var d = ParseKeyValues(raw);
+        var p = new ConnectionParameters();
 
-        if (dict.TryGetValue("Password", out var pwd))
-            parameters.Password = DecryptIfNeeded(pwd);
+        // ── Database ──────────────────────────────────────────────────────
+        if (d.TryGetValue("ServerName",   out var sn))  p.ServerName    = sn;
+        if (d.TryGetValue("UserName",     out var un))  p.UserName      = un;
+        if (d.TryGetValue("Password",     out var pwd)) p.Password      = DecryptIfNeeded(pwd);
+        if (d.TryGetValue("OracleDllPath",out var dll)) p.OracleDllPath = dll;
+        if (d.TryGetValue("TnsAdmin",     out var tns)) p.TnsAdmin      = tns;
+        if (d.TryGetValue("History",      out var his)) p.History       = his;
+        if (d.TryGetValue("DriverId",     out var did)) p.DriverId      = did;
+        if (d.TryGetValue("CharacterSet", out var cs))  p.CharacterSet  = cs;
 
-        if (dict.TryGetValue("Database", out var db))
-            parameters.Database = db;
+        for (int i = 0; i < p.Servers.Length; i++)
+        {
+            if (d.TryGetValue($"Server{i}", out var sv))
+                p.Servers[i] = sv;
+        }
 
-        if (dict.TryGetValue("UserName", out var user))
-            parameters.UserName = user;
+        // ── Language ──────────────────────────────────────────────────────
+        if (d.TryGetValue("Language",   out var lang))  p.Language   = lang;
+        if (d.TryGetValue("LanguageEx", out var langx)) p.LanguageEx = langx;
 
-        if (dict.TryGetValue("DriverId", out var driver))
-            parameters.DriverId = driver;
+        // ── Local ─────────────────────────────────────────────────────────
+        if (d.TryGetValue("Company", out var co) && int.TryParse(co, out var coN)) p.Company = coN;
+        if (d.TryGetValue("Station", out var st) && int.TryParse(st, out var stN)) p.Station = stN;
+        if (d.TryGetValue("UserId",  out var ui) && int.TryParse(ui, out var uiN)) p.UserId  = uiN;
 
-        if (dict.TryGetValue("CharacterSet", out var cs))
-            parameters.CharacterSet = cs;
-
-        if (dict.TryGetValue("VendorLib", out var lib))
-            parameters.VendorLib = lib;
-
-        if (dict.TryGetValue("TnsAdmin", out var tns))
-            parameters.TnsAdmin = tns;
-
-        return parameters;
+        return p;
     }
 
     // -------------------------------------------------------------------------
@@ -95,15 +96,6 @@ public sealed class DistribConnectionProvider
     /// <c>distribconnection</c> environment variable at the requested
     /// <paramref name="target"/> scope.
     /// </summary>
-    /// <param name="parameters">Connection parameters to persist.</param>
-    /// <param name="target">
-    /// Environment variable target scope.  Defaults to
-    /// <see cref="EnvironmentVariableTarget.Process"/> which is useful for
-    /// testing without requiring elevated rights.  Use
-    /// <see cref="EnvironmentVariableTarget.Machine"/> or
-    /// <see cref="EnvironmentVariableTarget.User"/> to make the setting
-    /// persistent across process restarts.
-    /// </param>
     public void Write(
         ConnectionParameters parameters,
         EnvironmentVariableTarget target = EnvironmentVariableTarget.Process)
@@ -115,15 +107,29 @@ public sealed class DistribConnectionProvider
             : parameters.Password;
 
         var sb = new StringBuilder();
-        AppendPair(sb, "Password", pwd);
-        AppendPair(sb, "Database", parameters.Database);
-        AppendPair(sb, "UserName", parameters.UserName);
-        AppendPair(sb, "DriverId", parameters.DriverId);
-        AppendPair(sb, "CharacterSet", parameters.CharacterSet);
-        AppendPair(sb, "VendorLib", parameters.VendorLib);
-        AppendPair(sb, "TnsAdmin", parameters.TnsAdmin);
 
-        // Remove the trailing semicolon.
+        // Database
+        Append(sb, "ServerName",    parameters.ServerName);
+        Append(sb, "UserName",      parameters.UserName);
+        Append(sb, "Password",      pwd);
+        Append(sb, "OracleDllPath", parameters.OracleDllPath);
+        Append(sb, "TnsAdmin",      parameters.TnsAdmin);
+        Append(sb, "History",       parameters.History);
+        Append(sb, "DriverId",      parameters.DriverId);
+        Append(sb, "CharacterSet",  parameters.CharacterSet);
+
+        for (int i = 0; i < parameters.Servers.Length; i++)
+            Append(sb, $"Server{i}", parameters.Servers[i] ?? string.Empty);
+
+        // Language
+        Append(sb, "Language",   parameters.Language);
+        Append(sb, "LanguageEx", parameters.LanguageEx);
+
+        // Local
+        Append(sb, "Company", parameters.Company.ToString());
+        Append(sb, "Station", parameters.Station.ToString());
+        Append(sb, "UserId",  parameters.UserId.ToString());
+
         if (sb.Length > 0 && sb[^1] == ';')
             sb.Length--;
 
@@ -134,43 +140,34 @@ public sealed class DistribConnectionProvider
     // Helpers
     // -------------------------------------------------------------------------
 
-    private static string? GetRawValue()
-    {
-        // Prefer machine-level, fall back to user-level, then process-level.
-        return
-            Environment.GetEnvironmentVariable(EnvironmentVariableName, EnvironmentVariableTarget.Machine)
-            ?? Environment.GetEnvironmentVariable(EnvironmentVariableName, EnvironmentVariableTarget.User)
-            ?? Environment.GetEnvironmentVariable(EnvironmentVariableName, EnvironmentVariableTarget.Process);
-    }
+    private static string? GetRawValue() =>
+        Environment.GetEnvironmentVariable(EnvironmentVariableName, EnvironmentVariableTarget.Machine)
+        ?? Environment.GetEnvironmentVariable(EnvironmentVariableName, EnvironmentVariableTarget.User)
+        ?? Environment.GetEnvironmentVariable(EnvironmentVariableName, EnvironmentVariableTarget.Process);
 
     private string DecryptIfNeeded(string value) =>
         _encryptor is not null ? _encryptor.Decrypt(value) : value;
 
-    private static void AppendPair(StringBuilder sb, string key, string value)
+    private static void Append(StringBuilder sb, string key, string value)
     {
-        if (!string.IsNullOrEmpty(value))
-            sb.Append(key).Append('=').Append(value).Append(';');
+        // Always write the key (even if empty) so all fields are always present
+        // in the serialised string, making it easy to locate them with tools.
+        sb.Append(key).Append('=').Append(value).Append(';');
     }
 
-    /// <summary>
-    /// Parses a semicolon-delimited <c>key=value</c> string into a dictionary.
-    /// Keys are matched case-insensitively so that existing variables set by
-    /// other tools (e.g. <c>PASSWORD</c> vs <c>Password</c>) are handled
-    /// correctly.
-    /// </summary>
     private static Dictionary<string, string> ParseKeyValues(string raw)
     {
         var dict = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         foreach (var segment in raw.Split(';', StringSplitOptions.RemoveEmptyEntries))
         {
             var idx = segment.IndexOf('=');
-            if (idx <= 0)
-                continue;
+            if (idx <= 0) continue;
             var key = segment[..idx].Trim();
-            var val = segment[(idx + 1)..];
+            var val = segment[(idx + 1)..].Trim();
             if (!string.IsNullOrEmpty(key))
                 dict[key] = val;
         }
         return dict;
     }
 }
+
